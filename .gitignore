@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Model weights & large files (download at runtime)
+base_model/
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Output / training artifacts
+output/
+.kiro_tmp/
+
+# Data (manifests & audio — keep only sample/template files)
+data/
+*.wav
+*.mp3
+*.flac
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Zip artifacts
+*.zip
