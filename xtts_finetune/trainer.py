@@ -257,10 +257,36 @@ def xtts_forward(
         if hasattr(model, "gpt") and hasattr(model, "tokenizer"):
             try:
                 # Tokenize text
+                # Try multiple language codes: None (auto-detect), "vi", "en", or first available
                 token_ids_list = []
-                for t in texts:
-                    ids = model.tokenizer.encode(t, lang="vi")
-                    token_ids_list.append(torch.tensor(ids, dtype=torch.long))
+                tokenize_success = False
+                
+                # Try without language code first (auto-detect)
+                try:
+                    for t in texts:
+                        ids = model.tokenizer.encode(t)
+                        token_ids_list.append(torch.tensor(ids, dtype=torch.long))
+                    tokenize_success = True
+                except Exception:
+                    token_ids_list = []
+                
+                # If that failed, try with supported languages
+                if not tokenize_success:
+                    # Get supported languages if available
+                    supported_langs = getattr(model.tokenizer, 'languages', ['en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'tr', 'ru', 'nl', 'cs', 'ar', 'zh-cn', 'ja', 'hu', 'ko'])
+                    
+                    # Try first supported language
+                    if supported_langs:
+                        try:
+                            for t in texts:
+                                ids = model.tokenizer.encode(t, lang=supported_langs[0])
+                                token_ids_list.append(torch.tensor(ids, dtype=torch.long))
+                            tokenize_success = True
+                        except Exception:
+                            pass
+                
+                if not tokenize_success:
+                    raise RuntimeError("Tokenizer failed with all language options")
 
                 max_text_len = max(t.shape[0] for t in token_ids_list)
                 text_padded  = torch.zeros(B, max_text_len, dtype=torch.long, device=device)
