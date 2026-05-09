@@ -19,6 +19,39 @@ from .utils import get_logger, free_memory
 
 # ─── HuggingFace Snapshot Download ────────────────────────────────────────────
 
+def _ensure_numpy_compat():
+    """
+    Kaggle Python 3.12 ships numpy 2.x but scipy/sklearn/transformers
+    were compiled against numpy 1.x → ImportError on '_center' etc.
+    Downgrade numpy to 1.26.4 in-process if needed.
+    This must run BEFORE any TTS / transformers import.
+    """
+    import subprocess, sys, importlib
+    try:
+        import numpy as np
+        major = int(np.__version__.split(".")[0])
+        if major >= 2:
+            print(f"⚠️  numpy {np.__version__} detected — downgrading to 1.26.4 for Kaggle compatibility...")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-q",
+                 "numpy==1.26.4", "--force-reinstall"],
+                stdout=subprocess.DEVNULL,
+            )
+            # Reload numpy in the current process
+            import importlib
+            importlib.invalidate_caches()
+            print("✅ numpy downgraded — please RESTART THE KERNEL and re-run from Cell 1")
+            raise RuntimeError(
+                "numpy was downgraded to 1.26.4. "
+                "Please restart the Kaggle kernel (Run → Restart & Clear Output) "
+                "and run all cells again."
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # numpy already compatible or pip failed — proceed anyway
+
+
 def download_base_model(config: TrainingConfig, logger: logging.Logger) -> str:
     """
     Download the XTTS v2 checkpoint from HuggingFace Hub if not already present.
@@ -77,6 +110,9 @@ def load_xtts_model(
     Returns:
         (model, xtts_config) — the XTTS model and its config object
     """
+    # ── Ensure numpy compatibility before importing TTS ───────────────────────
+    _ensure_numpy_compat()
+
     # Import Coqui TTS internals
     try:
         from TTS.tts.configs.xtts_config import XttsConfig

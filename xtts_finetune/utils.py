@@ -275,7 +275,20 @@ def load_audio_safe(path: str, target_sr: int = 22050):
 
 
 def get_audio_duration(path: str) -> float:
-    """Return audio duration in seconds without loading the full file."""
+    """
+    Return audio duration in seconds without loading the full file.
+    Uses soundfile as primary backend (more reliable on Kaggle/Python 3.12),
+    falls back to torchaudio if soundfile is unavailable.
+    """
+    # Primary: soundfile (no numpy version issues)
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        return info.frames / info.samplerate
+    except Exception:
+        pass
+
+    # Fallback: torchaudio
     try:
         import torchaudio
         info = torchaudio.info(path)
