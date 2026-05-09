@@ -182,28 +182,75 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
     """
     Extract mel spectrograms from raw audio using XTTS's internal audio processor.
     Returns (mel_padded [B, n_mels, T], mel_lengths [B]) or (None, None) on failure.
+    
+    XTTS v2 uses model.audio_config for mel extraction, not model.ap
     """
     B = audio.shape[0]
 
-    if hasattr(model, "ap"):
+    # XTTS v2 uses audio_config, not ap
+    if hasattr(model, "audio_config") or hasattr(model, "ap"):
         target_mels = []
         valid_indices = []
         
+        # Get the audio processor
+        audio_processor = None
+        if hasattr(model, "ap"):
+            audio_processor = model.ap
+        elif hasattr(model, "audio_config"):
+            # Create audio processor from config
+            try:
+                from TTS.tts.layers.xtts.audio_utils import TorchSTFT
+                audio_processor = TorchSTFT(
+                    n_fft=model.audio_config.get("fft_size", 1024),
+                    hop_length=model.audio_config.get("hop_length", 256),
+                    win_length=model.audio_config.get("win_length", 1024),
+                    sample_rate=model.audio_config.get("sample_rate", 22050),
+                    n_mels=model.audio_config.get("num_mels", 80),
+                    mel_fmin=model.audio_config.get("mel_fmin", 0),
+                    mel_fmax=model.audio_config.get("mel_fmax", 8000),
+                )
+                audio_processor = audio_processor.to(device)
+            except Exception as e:
+                # Fallback: use torchaudio
+                pass
+        
         for i in range(B):
             try:
-                wav = audio[i, :audio_lengths[i]].cpu().numpy()
+                wav = audio[i, :audio_lengths[i]]
                 
                 # Skip if audio is too short or invalid
-                if len(wav) < 100:  # Minimum 100 samples
+                if wav.shape[0] < 100:  # Minimum 100 samples
                     continue
-                    
-                mel = model.ap.melspectrogram(wav)  # [n_mels, T]
+                
+                # Ensure wav is on correct device and has correct shape
+                if wav.device != device:
+                    wav = wav.to(device)
+                
+                # Extract mel using audio processor
+                if audio_processor is not None:
+                    if hasattr(audio_processor, "melspectrogram"):
+                        mel = audio_processor.melspectrogram(wav.cpu().numpy())
+                        mel = torch.from_numpy(mel)
+                    else:
+                        # TorchSTFT expects [1, T]
+                        mel = audio_processor.mel_spectrogram(wav.unsqueeze(0))  # [1, n_mels, T]
+                        mel = mel.squeeze(0)  # [n_mels, T]
+                else:
+                    # Fallback: use torchaudio
+                    import torchaudio.transforms as T
+                    mel_transform = T.MelSpectrogram(
+                        sample_rate=22050,
+                        n_fft=1024,
+                        hop_length=256,
+                        n_mels=80,
+                    ).to(device)
+                    mel = mel_transform(wav)  # [n_mels, T]
                 
                 # Validate mel output
-                if mel is None or mel.size == 0 or mel.shape[1] < 1:
+                if mel is None or mel.numel() == 0 or mel.shape[-1] < 1:
                     continue
                     
-                target_mels.append(torch.from_numpy(mel))
+                target_mels.append(mel.cpu())
                 valid_indices.append(i)
                 
             except Exception as e:
@@ -214,14 +261,14 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
         if len(target_mels) == 0:
             return None, None
 
-        max_mel_len = max(m.shape[1] for m in target_mels)
+        max_mel_len = max(m.shape[-1] for m in target_mels)
         n_mels      = target_mels[0].shape[0]
         mel_padded  = torch.zeros(len(target_mels), n_mels, max_mel_len, dtype=torch.float32)
         mel_lengths = torch.zeros(len(target_mels), dtype=torch.long)
         
         for idx, m in enumerate(target_mels):
-            mel_padded[idx, :, :m.shape[1]] = m
-            mel_lengths[idx] = m.shape[1]
+            mel_padded[idx, :, :m.shape[-1]] = m
+            mel_lengths[idx] = m.shape[-1]
 
         return mel_padded.to(device), mel_lengths.to(device)
 
