@@ -178,7 +178,7 @@ class XTTSLoss(nn.Module):
 
 # ─── XTTS Forward Pass Wrapper ────────────────────────────────────────────────
 
-def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor, device: torch.device):
+def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor, device: torch.device, logger=None):
     """
     Extract mel spectrograms from raw audio using XTTS's internal audio processor.
     Returns (mel_padded [B, n_mels, T], mel_lengths [B]) or (None, None) on failure.
@@ -186,6 +186,15 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
     XTTS v2 uses model.audio_config for mel extraction, not model.ap
     """
     B = audio.shape[0]
+
+    # Debug: Log what attributes the model has
+    if logger and not hasattr(_get_mel_from_audio, '_logged_once'):
+        has_ap = hasattr(model, "ap")
+        has_audio_config = hasattr(model, "audio_config")
+        logger.info(f"Model attributes: has_ap={has_ap}, has_audio_config={has_audio_config}")
+        if has_audio_config:
+            logger.info(f"audio_config keys: {list(model.audio_config.keys()) if isinstance(model.audio_config, dict) else 'not a dict'}")
+        _get_mel_from_audio._logged_once = True
 
     # XTTS v2 uses audio_config, not ap
     if hasattr(model, "audio_config") or hasattr(model, "ap"):
@@ -212,6 +221,8 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
                 audio_processor = audio_processor.to(device)
             except Exception as e:
                 # Fallback: use torchaudio
+                if logger:
+                    logger.debug(f"Failed to create TorchSTFT, will use torchaudio fallback")
                 pass
         
         for i in range(B):
@@ -254,7 +265,9 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
                 valid_indices.append(i)
                 
             except Exception as e:
-                # Skip problematic audio samples silently
+                # Skip problematic audio samples
+                if logger and i == 0:  # Log only first failure to avoid spam
+                    logger.debug(f"Mel extraction failed for sample {i}: {type(e).__name__}: {e}")
                 continue
 
         # If no valid mels extracted, return None
@@ -272,6 +285,12 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
 
         return mel_padded.to(device), mel_lengths.to(device)
 
+    # Model doesn't have audio_config or ap
+    if logger and not hasattr(_get_mel_from_audio, '_logged_no_processor'):
+        logger.error("Model has neither 'audio_config' nor 'ap' attribute - cannot extract mel spectrograms!")
+        logger.error(f"Available model attributes: {[attr for attr in dir(model) if not attr.startswith('_')][:20]}")
+        _get_mel_from_audio._logged_no_processor = True
+    
     return None, None
 
 
@@ -302,12 +321,12 @@ def xtts_forward(
         B = audio.shape[0]
 
         # ── 1. Extract mel spectrograms ───────────────────────────────────────
-        target_mel, mel_lengths = _get_mel_from_audio(model, audio, audio_lengths, device)
+        target_mel, mel_lengths = _get_mel_from_audio(model, audio, audio_lengths, device, logger)
         
         # If mel extraction failed, skip this batch
         if target_mel is None:
             if logger:
-                logger.debug(f"Mel extraction failed for batch, skipping")
+                logger.warning(f"Mel extraction failed for batch - check if model has audio_config or ap attribute")
             return None, None
 
         # ── 2. Speaker conditioning ───────────────────────────────────────────
