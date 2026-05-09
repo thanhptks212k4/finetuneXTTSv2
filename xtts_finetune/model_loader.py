@@ -19,40 +19,6 @@ from .utils import get_logger, free_memory
 
 # ─── HuggingFace Snapshot Download ────────────────────────────────────────────
 
-def _ensure_numpy_compat():
-    """
-    Kaggle Python 3.12 ships numpy 2.x but scipy/sklearn/transformers
-    were compiled against numpy 1.x → ImportError on '_center' etc.
-    Downgrade numpy to 1.26.4 in-process if needed.
-    This must run BEFORE any TTS / transformers import.
-    
-    NOTE: For automated notebooks, we downgrade but continue execution.
-    The downgrade takes effect for subprocess imports (TTS library).
-    """
-    import subprocess, sys, importlib
-    try:
-        import numpy as np
-        major = int(np.__version__.split(".")[0])
-        if major >= 2:
-            print(f"⚠️  numpy {np.__version__} detected — downgrading to 1.26.4 for Kaggle compatibility...")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-q",
-                 "numpy==1.26.4", "--force-reinstall"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Invalidate caches so new imports use 1.26.4
-            importlib.invalidate_caches()
-            print("✅ numpy downgraded to 1.26.4 (will take effect for TTS imports)")
-            # DO NOT raise error - continue execution
-            # The downgrade is effective for subprocess imports
-    except Exception as e:
-        # If downgrade fails, log but continue
-        print(f"⚠️  numpy downgrade failed: {e}")
-        print("Continuing anyway - may encounter import errors...")
-        pass
-
-
 def download_base_model(config: TrainingConfig, logger: logging.Logger) -> str:
     """
     Download the XTTS v2 checkpoint from HuggingFace Hub if not already present.
@@ -111,9 +77,6 @@ def load_xtts_model(
     Returns:
         (model, xtts_config) — the XTTS model and its config object
     """
-    # ── Ensure numpy compatibility before importing TTS ───────────────────────
-    _ensure_numpy_compat()
-
     # Import Coqui TTS internals
     try:
         from TTS.tts.configs.xtts_config import XttsConfig

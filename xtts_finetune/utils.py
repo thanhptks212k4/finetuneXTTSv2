@@ -49,8 +49,19 @@ def get_logger(name: str, log_dir: str = "./output/logs") -> logging.Logger:
 
 def set_seed(seed: int = 42):
     """Fix all random seeds for reproducibility."""
+    import random
+    import numpy as np
+    import torch
+    
     random.seed(seed)
-    np.random.seed(seed)
+    
+    # Numpy 2.x compatible random seed
+    try:
+        np.random.seed(seed)
+    except (ValueError, AttributeError):
+        # Fallback for numpy 2.x if seed() is deprecated
+        np.random.default_rng(seed)
+    
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
