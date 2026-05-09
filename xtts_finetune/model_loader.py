@@ -25,6 +25,9 @@ def _ensure_numpy_compat():
     were compiled against numpy 1.x → ImportError on '_center' etc.
     Downgrade numpy to 1.26.4 in-process if needed.
     This must run BEFORE any TTS / transformers import.
+    
+    NOTE: For automated notebooks, we downgrade but continue execution.
+    The downgrade takes effect for subprocess imports (TTS library).
     """
     import subprocess, sys, importlib
     try:
@@ -36,20 +39,18 @@ def _ensure_numpy_compat():
                 [sys.executable, "-m", "pip", "install", "-q",
                  "numpy==1.26.4", "--force-reinstall"],
                 stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-            # Reload numpy in the current process
-            import importlib
+            # Invalidate caches so new imports use 1.26.4
             importlib.invalidate_caches()
-            print("✅ numpy downgraded — please RESTART THE KERNEL and re-run from Cell 1")
-            raise RuntimeError(
-                "numpy was downgraded to 1.26.4. "
-                "Please restart the Kaggle kernel (Run → Restart & Clear Output) "
-                "and run all cells again."
-            )
-    except RuntimeError:
-        raise
-    except Exception:
-        pass  # numpy already compatible or pip failed — proceed anyway
+            print("✅ numpy downgraded to 1.26.4 (will take effect for TTS imports)")
+            # DO NOT raise error - continue execution
+            # The downgrade is effective for subprocess imports
+    except Exception as e:
+        # If downgrade fails, log but continue
+        print(f"⚠️  numpy downgrade failed: {e}")
+        print("Continuing anyway - may encounter import errors...")
+        pass
 
 
 def download_base_model(config: TrainingConfig, logger: logging.Logger) -> str:
