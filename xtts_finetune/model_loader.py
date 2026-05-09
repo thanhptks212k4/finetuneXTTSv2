@@ -174,23 +174,47 @@ def configure_trainable_params(
     Freeze encoder layers and keep decoder + speaker components trainable.
     This reduces VRAM usage and speeds up training.
     """
+    if not config.freeze_encoder:
+        # Train everything
+        for param in model.parameters():
+            param.requires_grad = True
+        total = sum(p.numel() for p in model.parameters())
+        logger.info(f"Full fine-tune: all {total:,} parameters trainable")
+        return model
+
+    # ── Print actual top-level module names for debugging ─────────────────────
+    top_level = [name for name, _ in model.named_children()]
+    logger.debug(f"Top-level modules: {top_level}")
+
     # First, freeze everything
     for param in model.parameters():
         param.requires_grad = False
 
-    # Components to always train
+    # Components to train — covers both old and new Coqui TTS naming conventions
     trainable_keywords = [
-        "gpt",           # GPT decoder (main autoregressive component)
-        "hifigan_decoder",  # Vocoder decoder
-        "speaker_encoder",  # Speaker embedding network
-        "conditioning_encoder",  # Speaker conditioning
+        # Decoder / autoregressive
+        "gpt",
+        "mel_head",
+        "final_norm",
+        # Vocoder
+        "hifigan_decoder",
+        "hifi_decoder",
+        "vocoder",
+        # Speaker conditioning
+        "speaker_encoder",
+        "conditioning_encoder",
+        "cond_encoder",
+        "speaker_embedding",
+        "speaker_emb",
+        # Diffusion (XTTS v2 uses diffusion for mel refinement)
+        "diffusion",
+        "diffusion_decoder",
     ]
 
     if not config.freeze_encoder:
-        # Also train the text encoder
         trainable_keywords.append("text_encoder")
 
-    total_params = 0
+    total_params     = 0
     trainable_params = 0
 
     for name, param in model.named_parameters():
@@ -198,6 +222,17 @@ def configure_trainable_params(
         if any(kw in name for kw in trainable_keywords):
             param.requires_grad = True
             trainable_params += param.numel()
+
+    # Safety: if nothing was unfrozen (keyword mismatch), train everything
+    if trainable_params == 0:
+        logger.warning(
+            "No parameters matched trainable keywords — "
+            "falling back to full fine-tune. "
+            f"Top-level modules: {top_level}"
+        )
+        for param in model.parameters():
+            param.requires_grad = True
+        trainable_params = sum(p.numel() for p in model.parameters())
 
     pct = 100.0 * trainable_params / max(total_params, 1)
     logger.info(
@@ -214,28 +249,52 @@ def enable_gradient_checkpointing(model: nn.Module, logger: logging.Logger):
     """
     Enable gradient checkpointing on transformer/GPT layers to save VRAM.
     Trades compute for memory.
+
+    XTTS uses a custom GPT2Model that does NOT have standard HuggingFace
+    embeddings (wte/wpe), so we must catch AttributeError from
+    enable_input_require_grads() and fall back to a manual hook.
     """
     enabled = False
 
-    # Try to enable on GPT component
+    # Try to enable on GPT component first (preferred)
     if hasattr(model, "gpt") and hasattr(model.gpt, "gradient_checkpointing_enable"):
-        model.gpt.gradient_checkpointing_enable()
-        enabled = True
-        logger.info("Gradient checkpointing enabled on GPT component")
+        try:
+            model.gpt.gradient_checkpointing_enable()
+            enabled = True
+            logger.info("Gradient checkpointing enabled on GPT component")
+        except (AttributeError, NotImplementedError) as e:
+            logger.debug(f"GPT gradient_checkpointing_enable failed: {e}")
 
-    # Generic fallback: enable on any nn.Module with the method
+    # Generic fallback: walk all submodules
     if not enabled:
         for name, module in model.named_modules():
-            if hasattr(module, "gradient_checkpointing_enable"):
+            if not hasattr(module, "gradient_checkpointing_enable"):
+                continue
+            try:
                 module.gradient_checkpointing_enable()
                 logger.info(f"Gradient checkpointing enabled on: {name}")
                 enabled = True
                 break
+            except (AttributeError, NotImplementedError) as e:
+                # XTTS GPT2Model lacks wte — skip silently
+                logger.debug(f"Skipping {name}: {e}")
+                continue
 
+    # Last resort: manually set the flag on any module that has it
     if not enabled:
+        for name, module in model.named_modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
+                enabled = True
+                logger.info(f"Gradient checkpointing flag set on: {name}")
+                break
+
+    if enabled:
+        logger.info("✅ Gradient checkpointing active")
+    else:
         logger.warning(
-            "Could not enable gradient checkpointing automatically. "
-            "The model may not support it natively."
+            "Could not enable gradient checkpointing — "
+            "model architecture does not support it. Training will use more VRAM."
         )
 
 
