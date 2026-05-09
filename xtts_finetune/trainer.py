@@ -181,28 +181,51 @@ class XTTSLoss(nn.Module):
 def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor, device: torch.device):
     """
     Extract mel spectrograms from raw audio using XTTS's internal audio processor.
-    Returns (mel_padded [B, n_mels, T], mel_lengths [B])
+    Returns (mel_padded [B, n_mels, T], mel_lengths [B]) or (None, None) on failure.
     """
     B = audio.shape[0]
 
     if hasattr(model, "ap"):
         target_mels = []
+        valid_indices = []
+        
         for i in range(B):
-            wav = audio[i, :audio_lengths[i]].cpu().numpy()
-            mel = model.ap.melspectrogram(wav)          # [n_mels, T]
-            target_mels.append(torch.from_numpy(mel))
+            try:
+                wav = audio[i, :audio_lengths[i]].cpu().numpy()
+                
+                # Skip if audio is too short or invalid
+                if len(wav) < 100:  # Minimum 100 samples
+                    continue
+                    
+                mel = model.ap.melspectrogram(wav)  # [n_mels, T]
+                
+                # Validate mel output
+                if mel is None or mel.size == 0 or mel.shape[1] < 1:
+                    continue
+                    
+                target_mels.append(torch.from_numpy(mel))
+                valid_indices.append(i)
+                
+            except Exception as e:
+                # Skip problematic audio samples silently
+                continue
+
+        # If no valid mels extracted, return None
+        if len(target_mels) == 0:
+            return None, None
 
         max_mel_len = max(m.shape[1] for m in target_mels)
         n_mels      = target_mels[0].shape[0]
-        mel_padded  = torch.zeros(B, n_mels, max_mel_len, dtype=torch.float32)
-        mel_lengths = torch.zeros(B, dtype=torch.long)
-        for i, m in enumerate(target_mels):
-            mel_padded[i, :, :m.shape[1]] = m
-            mel_lengths[i] = m.shape[1]
+        mel_padded  = torch.zeros(len(target_mels), n_mels, max_mel_len, dtype=torch.float32)
+        mel_lengths = torch.zeros(len(target_mels), dtype=torch.long)
+        
+        for idx, m in enumerate(target_mels):
+            mel_padded[idx, :, :m.shape[1]] = m
+            mel_lengths[idx] = m.shape[1]
 
         return mel_padded.to(device), mel_lengths.to(device)
 
-    return None, audio_lengths
+    return None, None
 
 
 def xtts_forward(
@@ -233,6 +256,12 @@ def xtts_forward(
 
         # ── 1. Extract mel spectrograms ───────────────────────────────────────
         target_mel, mel_lengths = _get_mel_from_audio(model, audio, audio_lengths, device)
+        
+        # If mel extraction failed, skip this batch
+        if target_mel is None:
+            if logger:
+                logger.debug(f"Mel extraction failed for batch, skipping")
+            return None, None
 
         # ── 2. Speaker conditioning ───────────────────────────────────────────
         if speaker_embedding is not None:
