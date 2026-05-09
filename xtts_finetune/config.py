@@ -12,7 +12,10 @@ from typing import Optional, List, Dict
 class TrainingConfig:
     # ─── Paths ────────────────────────────────────────────────────────────────
     # HuggingFace repo for base model snapshot
-    hf_repo_id: str = "anhnh2002/vnTTS"
+    # Options:
+    #   - "coqui/XTTS-v2" (official base model, multilingual)
+    #   - "anhnh2002/vnTTS" (Vietnamese fine-tuned)
+    hf_repo_id: str = "coqui/XTTS-v2"
 
     # Local directory where the HF snapshot is cached / downloaded
     base_model_dir: str = "./base_model"

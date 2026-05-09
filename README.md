@@ -6,7 +6,7 @@ Production-ready pipeline to fine-tune **XTTS v2** on a custom Vietnamese datase
 
 | Feature | Details |
 |---|---|
-| Base model | `anhnh2002/vnTTS` (HuggingFace) |
+| Base model | `coqui/XTTS-v2` (official multilingual base model) |
 | Framework | Coqui TTS + PyTorch (no HF Trainer) |
 | Training | Patch-based (5000 samples/patch) |
 | Memory | fp16, gradient checkpointing, `empty_cache()` |
@@ -140,7 +140,7 @@ All settings live in `config.py`. Key parameters:
 ```python
 config = TrainingConfig(
     # Model
-    hf_repo_id="anhnh2002/vnTTS",
+    hf_repo_id="coqui/XTTS-v2",  # Official base model
     base_model_dir="./base_model",
 
     # Data
@@ -236,5 +236,5 @@ LoRA targets attention projection layers (`q_proj`, `v_proj`, `k_proj`, `out_pro
 ## License
 
 This pipeline is provided for research and educational use.
-The base model (`anhnh2002/vnTTS`) is subject to its own license on HuggingFace.
+The base model (`coqui/XTTS-v2`) is licensed under the Coqui Public Model License.
 Coqui TTS is licensed under the Mozilla Public License 2.0.
