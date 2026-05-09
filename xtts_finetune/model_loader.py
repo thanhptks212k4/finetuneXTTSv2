@@ -119,6 +119,24 @@ def load_xtts_model(
         if hasattr(model, "mel_stats"):
             model.mel_stats = mel_stats
 
+    # ── Attach audio_config to model for mel extraction ──────────────────────
+    # The mel extraction function needs access to audio parameters
+    if hasattr(xtts_config, 'audio') and not hasattr(model, 'audio_config'):
+        model.audio_config = xtts_config.audio
+        logger.info("Attached audio_config to model from xtts_config.audio")
+    elif not hasattr(model, 'audio_config'):
+        # Fallback: create default audio config
+        model.audio_config = {
+            "sample_rate": 22050,
+            "fft_size": 1024,
+            "win_length": 1024,
+            "hop_length": 256,
+            "num_mels": 80,
+            "mel_fmin": 0,
+            "mel_fmax": 8000,
+        }
+        logger.info("Created default audio_config for model")
+
     # ── Move to device ────────────────────────────────────────────────────────
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -375,31 +393,56 @@ def save_checkpoint(
     # Get the actual model (unwrap LoRA/DataParallel if needed)
     model_to_save = model.module if hasattr(model, "module") else model
 
+    # Only save model weights, not optimizer (to save space)
     state = {
         "patch_idx": patch_idx,
         "step": step,
         "loss": loss,
         "model_state_dict": model_to_save.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "config": config.__dict__,
     }
 
-    # Patch checkpoint
+    # Patch checkpoint - only keep last 2 patches to save disk space
     ckpt_path = os.path.join(config.checkpoint_dir, f"patch_{patch_idx:04d}.pth")
-    torch.save(state, ckpt_path)
-    logger.info(f"Checkpoint saved: {ckpt_path} (loss={loss:.4f})")
+    
+    try:
+        # Save with error handling
+        torch.save(state, ckpt_path)
+        logger.info(f"Checkpoint saved: {ckpt_path} (loss={loss:.4f})")
+        
+        # Clean up old checkpoints (keep only last 2)
+        try:
+            all_patches = sorted([
+                f for f in os.listdir(config.checkpoint_dir) 
+                if f.startswith("patch_") and f.endswith(".pth")
+            ])
+            if len(all_patches) > 2:
+                for old_patch in all_patches[:-2]:
+                    old_path = os.path.join(config.checkpoint_dir, old_patch)
+                    os.remove(old_path)
+                    logger.info(f"Removed old checkpoint: {old_patch}")
+        except Exception as e:
+            logger.warning(f"Failed to clean old checkpoints: {e}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {e}")
+        # Try to save to /tmp as fallback
+        try:
+            fallback_path = f"/tmp/patch_{patch_idx:04d}.pth"
+            torch.save(state, fallback_path)
+            logger.warning(f"Saved to fallback location: {fallback_path}")
+        except Exception as e2:
+            logger.error(f"Fallback save also failed: {e2}")
+            return None
 
     # Best model checkpoint
     if is_best:
         best_path = os.path.join(config.checkpoint_dir, "best_model.pth")
-        torch.save(state, best_path)
-        logger.info(f"Best model updated: {best_path}")
-
-    # Optional zip
-    if config.zip_checkpoints:
-        from .utils import zip_checkpoint
-        zip_checkpoint(ckpt_path, logger)
+        try:
+            torch.save(state, best_path)
+            logger.info(f"Best model updated: {best_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save best model: {e}")
 
     return ckpt_path
 

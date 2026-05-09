@@ -180,118 +180,74 @@ class XTTSLoss(nn.Module):
 
 def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor, device: torch.device, logger=None):
     """
-    Extract mel spectrograms from raw audio using XTTS's internal audio processor.
-    Returns (mel_padded [B, n_mels, T], mel_lengths [B]) or (None, None) on failure.
-    
-    XTTS v2 uses model.audio_config for mel extraction, not model.ap
+    Extract mel spectrograms from raw audio - SIMPLIFIED VERSION.
+    Always uses torchaudio for reliability.
+    Returns (mel_padded [B, n_mels, T], mel_lengths [B])
     """
-    B = audio.shape[0]
-
-    # Debug: Log what attributes the model has
-    if logger and not hasattr(_get_mel_from_audio, '_logged_once'):
-        has_ap = hasattr(model, "ap")
-        has_audio_config = hasattr(model, "audio_config")
-        logger.info(f"Model attributes: has_ap={has_ap}, has_audio_config={has_audio_config}")
-        if has_audio_config:
-            logger.info(f"audio_config keys: {list(model.audio_config.keys()) if isinstance(model.audio_config, dict) else 'not a dict'}")
-        _get_mel_from_audio._logged_once = True
-
-    # XTTS v2 uses audio_config, not ap
-    if hasattr(model, "audio_config") or hasattr(model, "ap"):
-        target_mels = []
-        valid_indices = []
-        
-        # Get the audio processor
-        audio_processor = None
-        if hasattr(model, "ap"):
-            audio_processor = model.ap
-        elif hasattr(model, "audio_config"):
-            # Create audio processor from config
-            try:
-                from TTS.tts.layers.xtts.audio_utils import TorchSTFT
-                audio_processor = TorchSTFT(
-                    n_fft=model.audio_config.get("fft_size", 1024),
-                    hop_length=model.audio_config.get("hop_length", 256),
-                    win_length=model.audio_config.get("win_length", 1024),
-                    sample_rate=model.audio_config.get("sample_rate", 22050),
-                    n_mels=model.audio_config.get("num_mels", 80),
-                    mel_fmin=model.audio_config.get("mel_fmin", 0),
-                    mel_fmax=model.audio_config.get("mel_fmax", 8000),
-                )
-                audio_processor = audio_processor.to(device)
-            except Exception as e:
-                # Fallback: use torchaudio
-                if logger:
-                    logger.debug(f"Failed to create TorchSTFT, will use torchaudio fallback")
-                pass
-        
-        for i in range(B):
-            try:
-                wav = audio[i, :audio_lengths[i]]
-                
-                # Skip if audio is too short or invalid
-                if wav.shape[0] < 100:  # Minimum 100 samples
-                    continue
-                
-                # Ensure wav is on correct device and has correct shape
-                if wav.device != device:
-                    wav = wav.to(device)
-                
-                # Extract mel using audio processor
-                if audio_processor is not None:
-                    if hasattr(audio_processor, "melspectrogram"):
-                        mel = audio_processor.melspectrogram(wav.cpu().numpy())
-                        mel = torch.from_numpy(mel)
-                    else:
-                        # TorchSTFT expects [1, T]
-                        mel = audio_processor.mel_spectrogram(wav.unsqueeze(0))  # [1, n_mels, T]
-                        mel = mel.squeeze(0)  # [n_mels, T]
-                else:
-                    # Fallback: use torchaudio
-                    import torchaudio.transforms as T
-                    mel_transform = T.MelSpectrogram(
-                        sample_rate=22050,
-                        n_fft=1024,
-                        hop_length=256,
-                        n_mels=80,
-                    ).to(device)
-                    mel = mel_transform(wav)  # [n_mels, T]
-                
-                # Validate mel output
-                if mel is None or mel.numel() == 0 or mel.shape[-1] < 1:
-                    continue
-                    
-                target_mels.append(mel.cpu())
-                valid_indices.append(i)
-                
-            except Exception as e:
-                # Skip problematic audio samples
-                if logger and i == 0:  # Log only first failure to avoid spam
-                    logger.debug(f"Mel extraction failed for sample {i}: {type(e).__name__}: {e}")
-                continue
-
-        # If no valid mels extracted, return None
-        if len(target_mels) == 0:
-            return None, None
-
-        max_mel_len = max(m.shape[-1] for m in target_mels)
-        n_mels      = target_mels[0].shape[0]
-        mel_padded  = torch.zeros(len(target_mels), n_mels, max_mel_len, dtype=torch.float32)
-        mel_lengths = torch.zeros(len(target_mels), dtype=torch.long)
-        
-        for idx, m in enumerate(target_mels):
-            mel_padded[idx, :, :m.shape[-1]] = m
-            mel_lengths[idx] = m.shape[-1]
-
-        return mel_padded.to(device), mel_lengths.to(device)
-
-    # Model doesn't have audio_config or ap
-    if logger and not hasattr(_get_mel_from_audio, '_logged_no_processor'):
-        logger.error("Model has neither 'audio_config' nor 'ap' attribute - cannot extract mel spectrograms!")
-        logger.error(f"Available model attributes: {[attr for attr in dir(model) if not attr.startswith('_')][:20]}")
-        _get_mel_from_audio._logged_no_processor = True
+    import torchaudio.transforms as T
     
-    return None, None
+    B = audio.shape[0]
+    
+    # Use torchaudio MelSpectrogram - most reliable approach
+    mel_transform = T.MelSpectrogram(
+        sample_rate=22050,
+        n_fft=1024,
+        hop_length=256,
+        n_mels=80,
+        f_min=0,
+        f_max=8000,
+    ).to(device)
+    
+    target_mels = []
+    
+    for i in range(B):
+        try:
+            wav = audio[i, :audio_lengths[i]]
+            
+            # Skip if audio is too short
+            if wav.shape[0] < 256:  # At least one hop
+                if logger and not hasattr(_get_mel_from_audio, '_warned_short'):
+                    logger.warning(f"Skipping short audio: {wav.shape[0]} samples")
+                    _get_mel_from_audio._warned_short = True
+                continue
+            
+            # Ensure correct device
+            if wav.device != device:
+                wav = wav.to(device)
+            
+            # Extract mel
+            mel = mel_transform(wav)  # [n_mels, T]
+            
+            # Validate
+            if mel.numel() == 0 or mel.shape[-1] < 1:
+                continue
+                
+            target_mels.append(mel)
+            
+        except Exception as e:
+            if logger and not hasattr(_get_mel_from_audio, '_warned_error'):
+                logger.warning(f"Mel extraction error: {e}")
+                _get_mel_from_audio._warned_error = True
+            continue
+    
+    # If no valid mels, return None
+    if len(target_mels) == 0:
+        if logger and not hasattr(_get_mel_from_audio, '_warned_empty'):
+            logger.error("No valid mel spectrograms extracted from batch!")
+            _get_mel_from_audio._warned_empty = True
+        return None, None
+    
+    # Pad to same length
+    max_mel_len = max(m.shape[-1] for m in target_mels)
+    n_mels = target_mels[0].shape[0]
+    mel_padded = torch.zeros(len(target_mels), n_mels, max_mel_len, device=device)
+    mel_lengths = torch.zeros(len(target_mels), dtype=torch.long, device=device)
+    
+    for idx, m in enumerate(target_mels):
+        mel_padded[idx, :, :m.shape[-1]] = m
+        mel_lengths[idx] = m.shape[-1]
+    
+    return mel_padded, mel_lengths
 
 
 def xtts_forward(
