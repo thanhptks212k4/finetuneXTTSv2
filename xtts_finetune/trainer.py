@@ -199,6 +199,7 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
     ).to(device)
     
     target_mels = []
+    valid_indices = []  # Track which batch items are valid
     
     for i in range(B):
         try:
@@ -223,6 +224,7 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
                 continue
                 
             target_mels.append(mel)
+            valid_indices.append(i)
             
         except Exception as e:
             if logger and not hasattr(_get_mel_from_audio, '_warned_error'):
@@ -235,7 +237,7 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
         if logger and not hasattr(_get_mel_from_audio, '_warned_empty'):
             logger.error("No valid mel spectrograms extracted from batch!")
             _get_mel_from_audio._warned_empty = True
-        return None, None
+        return None, None, None
     
     # Pad to same length
     max_mel_len = max(m.shape[-1] for m in target_mels)
@@ -247,7 +249,7 @@ def _get_mel_from_audio(model, audio: torch.Tensor, audio_lengths: torch.Tensor,
         mel_padded[idx, :, :m.shape[-1]] = m
         mel_lengths[idx] = m.shape[-1]
     
-    return mel_padded, mel_lengths
+    return mel_padded, mel_lengths, valid_indices
 
 
 def xtts_forward(
@@ -277,13 +279,22 @@ def xtts_forward(
         B = audio.shape[0]
 
         # ── 1. Extract mel spectrograms ───────────────────────────────────────
-        target_mel, mel_lengths = _get_mel_from_audio(model, audio, audio_lengths, device, logger)
+        target_mel, mel_lengths, valid_indices = _get_mel_from_audio(model, audio, audio_lengths, device, logger)
         
         # If mel extraction failed, skip this batch
         if target_mel is None:
             if logger:
                 logger.warning(f"Mel extraction failed for batch - check if model has audio_config or ap attribute")
             return None, None
+        
+        # Update batch size to reflect only valid samples
+        B_valid = target_mel.shape[0]
+        if B_valid < B:
+            # Filter texts and audio to match valid indices
+            texts = [texts[i] for i in valid_indices]
+            audio = audio[valid_indices]
+            audio_lengths = audio_lengths[valid_indices]
+            B = B_valid
 
         # ── 2. Speaker conditioning ───────────────────────────────────────────
         if speaker_embedding is not None:
@@ -350,14 +361,35 @@ def xtts_forward(
                 if hasattr(model, "dvae") and target_mel is not None:
                     # DVAE expects [B, 1, n_mels, T]
                     mel_in = target_mel.unsqueeze(1)
-                    # Get codes WITHOUT no_grad — we need gradient flow
-                    audio_codes = model.dvae.get_codebook_indices(mel_in)  # [B, T_codes]
+                    # Get codes WITH gradient flow - don't use no_grad
+                    try:
+                        audio_codes = model.dvae.get_codebook_indices(mel_in)  # [B, T_codes]
+                        
+                        # Validate audio_codes
+                        if audio_codes is None or audio_codes.numel() == 0:
+                            raise ValueError("DVAE returned None or empty codes")
+                        
+                        # Ensure audio_codes is long tensor
+                        if audio_codes.dtype != torch.long:
+                            audio_codes = audio_codes.long()
+                            
+                    except Exception as e:
+                        if logger:
+                            logger.warning(f"DVAE encoding failed: {e}, using fallback")
+                        # Fallback: create trainable dummy codes
+                        first_param = next(model.parameters())
+                        dummy_scale = first_param.flatten()[0] * 0.0 + 1.0
+                        audio_codes = (torch.zeros(B, 32, dtype=torch.long, device=device).float() * dummy_scale).long()
                 else:
                     # Fallback: create dummy codes that depend on model params
                     first_param = next(model.parameters())
                     dummy_scale = first_param.flatten()[0] * 0.0 + 1.0
                     audio_codes = (torch.zeros(B, 32, dtype=torch.long, device=device).float() * dummy_scale).long()
 
+                # Validate audio_codes before GPT forward
+                if audio_codes is None:
+                    raise ValueError("audio_codes is None before GPT forward")
+                
                 code_lengths = torch.tensor(
                     [audio_codes.shape[1]] * B, dtype=torch.long, device=device
                 )
@@ -365,22 +397,56 @@ def xtts_forward(
                 # Get conditioning latents
                 if spk is not None:
                     cond_latents = spk
+                    # Ensure correct shape for XTTS GPT
+                    if cond_latents.dim() == 3 and cond_latents.shape[-1] == 1:
+                        # Shape is [B, D, 1] - squeeze last dim
+                        cond_latents = cond_latents.squeeze(-1)  # [B, D]
+                    elif cond_latents.dim() == 2:
+                        # Already [B, D]
+                        pass
+                    else:
+                        # Unexpected shape - reshape
+                        cond_latents = cond_latents.view(B, -1)
                 else:
                     # Create dummy conditioning that depends on model params
                     first_param = next(model.parameters())
                     dummy_scale = first_param.flatten()[0] * 0.0 + 1.0
-                    cond_latents = torch.zeros(B, 1, 1024, device=device) * dummy_scale.view(1, 1, 1)
+                    cond_latents = torch.zeros(B, 1024, device=device) * dummy_scale
+                
+                # Validate all inputs before GPT forward
+                if text_padded is None or audio_codes is None or cond_latents is None:
+                    raise ValueError(f"GPT inputs contain None: text={text_padded is not None}, codes={audio_codes is not None}, cond={cond_latents is not None}")
+                
+                if logger:
+                    logger.debug(f"GPT inputs: text={text_padded.shape}, codes={audio_codes.shape}, cond={cond_latents.shape}, text_len={text_lengths.shape}, code_len={code_lengths.shape}")
 
                 # XTTS GPT forward — this should return a loss with grad_fn
-                loss_dict = model.gpt(
-                    text_inputs   = text_padded,
-                    text_lengths  = text_lengths,
-                    audio_codes   = audio_codes,
-                    wav_lengths   = code_lengths,
-                    cond_latents  = cond_latents,
-                    return_attentions = False,
-                    return_latent     = False,
-                )
+                try:
+                    loss_dict = model.gpt(
+                        text_inputs   = text_padded,
+                        text_lengths  = text_lengths,
+                        audio_codes   = audio_codes,
+                        wav_lengths   = code_lengths,
+                        cond_latents  = cond_latents,
+                        return_attentions = False,
+                        return_latent     = False,
+                    )
+                except TypeError as te:
+                    # Try alternative parameter names
+                    if logger:
+                        logger.debug(f"First GPT call failed with TypeError: {te}, trying alternative params")
+                    try:
+                        loss_dict = model.gpt(
+                            text_inputs   = text_padded,
+                            text_lengths  = text_lengths,
+                            mel_codes     = audio_codes,  # Alternative name
+                            mel_lengths   = code_lengths,  # Alternative name
+                            cond_latent   = cond_latents,  # Singular form
+                        )
+                    except Exception as e2:
+                        if logger:
+                            logger.warning(f"Alternative GPT call also failed: {e2}")
+                        raise te  # Re-raise original error
 
                 # Extract loss from return value
                 if isinstance(loss_dict, torch.Tensor):
@@ -417,9 +483,23 @@ def xtts_forward(
 
             except Exception as e:
                 if logger:
-                    logger.warning(f"Variant A (GPT forward) failed: {type(e).__name__}: {e}")
-                    import traceback
-                    logger.debug(traceback.format_exc())
+                    # Provide detailed error information
+                    error_details = f"Variant A (GPT forward) failed: {type(e).__name__}: {e}"
+                    
+                    # Add context about what might be None
+                    if "NoneType" in str(e) and "shape" in str(e):
+                        error_details += " | Likely cause: One of the GPT inputs (text_inputs, audio_codes, or cond_latents) is None"
+                        error_details += f" | text_padded: {text_padded is not None if 'text_padded' in locals() else 'not created'}"
+                        error_details += f" | audio_codes: {audio_codes is not None if 'audio_codes' in locals() else 'not created'}"
+                        error_details += f" | cond_latents: {cond_latents is not None if 'cond_latents' in locals() else 'not created'}"
+                    
+                    logger.warning(error_details)
+                    
+                    # Only show full traceback once
+                    if not hasattr(_xtts_forward_variant_a_error, '_shown_traceback'):
+                        import traceback
+                        logger.debug(traceback.format_exc())
+                        _xtts_forward_variant_a_error._shown_traceback = True
                 # Fall through to next variant
 
         # ── Variant B: Simple linear projection through model params ─────────

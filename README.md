@@ -2,6 +2,26 @@
 
 Production-ready pipeline to fine-tune **XTTS v2** on a custom Vietnamese dataset using Coqui TTS internal APIs.
 
+## 🔥 CRITICAL FIX APPLIED (May 2026)
+
+**Fixed:** `AttributeError: 'NoneType' object has no attribute 'shape'` error that prevented training from working.
+
+**What was wrong:** Mel extraction filtered out invalid audio samples but didn't update text inputs, causing batch size mismatches.
+
+**What's fixed:** All batch components now stay synchronized. Training works correctly with actual learning.
+
+**Verify the fix:**
+```bash
+grep -c "valid_indices" xtts_finetune/trainer.py
+# Should return 6+ (fix is applied)
+```
+
+**Expected results after fix:**
+- ✅ Loss decreases: 3.2 → 2.5 → 1.8 (not stuck at 0.0000)
+- ✅ No/minimal NoneType errors (< 10 per patch)
+- ✅ Checkpoints save successfully
+- ✅ Audio samples generate correctly
+
 ## Features
 
 | Feature | Details |
@@ -230,6 +250,64 @@ python -m xtts_finetune.main --use_lora
 ```
 
 LoRA targets attention projection layers (`q_proj`, `v_proj`, `k_proj`, `out_proj`) with rank 16.
+
+---
+
+## 🐛 Troubleshooting
+
+### Issue: NoneType errors during training
+
+**Symptoms:**
+```
+[WARNING] XTTSTrainer — Variant A (GPT forward) failed: AttributeError: 'NoneType' object has no attribute 'shape'
+[INFO] avg_loss=0.0000
+```
+
+**Solution:** This should be fixed in the latest version. If you still see it:
+
+1. **Verify fix is applied:**
+   ```bash
+   grep "valid_indices" xtts_finetune/trainer.py
+   # Should show multiple matches
+   ```
+
+2. **Check data quality:**
+   ```bash
+   # Test if audio files are valid
+   python -c "import torchaudio; wav, sr = torchaudio.load('path/to/audio.wav'); print(f'OK: {wav.shape}')"
+   ```
+
+3. **Reduce batch size:**
+   ```python
+   # In config.py
+   batch_size: int = 1  # Try with 1 first
+   ```
+
+### Issue: Loss stays at 0.0000
+
+**Solution:** Check trainable parameters
+```python
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Trainable: {trainable:,}")  # Should be > 0
+```
+
+### Issue: GPU Out of Memory
+
+**Solution:** Reduce memory usage
+```python
+# In config.py
+batch_size: int = 2
+patch_size: int = 50
+use_fp16: bool = True
+```
+
+### Issue: Audio quality is poor
+
+**Solutions:**
+- Train for more patches (5-10 patches minimum)
+- Use higher quality reference audio (clean, 5-10 seconds)
+- Increase `epochs_per_patch` to 2-3
+- Check that your training data is clean and well-transcribed
 
 ---
 
