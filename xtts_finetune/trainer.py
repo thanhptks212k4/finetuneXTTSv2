@@ -417,6 +417,17 @@ def xtts_forward(
                 if text_padded is None or audio_codes is None or cond_latents is None:
                     raise ValueError(f"GPT inputs contain None: text={text_padded is not None}, codes={audio_codes is not None}, cond={cond_latents is not None}")
                 
+                if text_lengths is None or code_lengths is None:
+                    raise ValueError(f"GPT length inputs are None: text_lengths={text_lengths is not None}, code_lengths={code_lengths is not None}")
+                
+                # Check for None values inside tensors (this is the real issue!)
+                if torch.any(torch.isnan(text_padded.float())):
+                    raise ValueError("text_padded contains NaN values")
+                if torch.any(torch.isnan(audio_codes.float())):
+                    raise ValueError("audio_codes contains NaN values")
+                if torch.any(torch.isnan(cond_latents)):
+                    raise ValueError("cond_latents contains NaN values")
+                
                 if logger:
                     logger.debug(f"GPT inputs: text={text_padded.shape}, codes={audio_codes.shape}, cond={cond_latents.shape}, text_len={text_lengths.shape}, code_len={code_lengths.shape}")
 
@@ -447,6 +458,16 @@ def xtts_forward(
                         if logger:
                             logger.warning(f"Alternative GPT call also failed: {e2}")
                         raise te  # Re-raise original error
+                except AttributeError as ae:
+                    # This is the actual error - something inside GPT is None
+                    if "'NoneType' object has no attribute 'shape'" in str(ae):
+                        # The error is INSIDE the GPT forward, not in our inputs
+                        # This means the GPT model itself has an issue
+                        if logger:
+                            logger.error(f"GPT internal error: {ae}")
+                            logger.error("This error occurs INSIDE model.gpt(), not from our inputs")
+                            logger.error("Possible causes: 1) GPT model not fully loaded, 2) Missing model components, 3) Incompatible XTTS version")
+                    raise ae
 
                 # Extract loss from return value
                 if isinstance(loss_dict, torch.Tensor):
@@ -496,22 +517,31 @@ def xtts_forward(
                     logger.warning(error_details)
                     
                     # Only show full traceback once
-                    if not hasattr(_xtts_forward_variant_a_error, '_shown_traceback'):
+                    if not hasattr(xtts_forward, '_shown_traceback'):
                         import traceback
                         logger.debug(traceback.format_exc())
-                        _xtts_forward_variant_a_error._shown_traceback = True
+                        xtts_forward._shown_traceback = True
                 # Fall through to next variant
 
         # ── Variant B: Simple linear projection through model params ─────────
         # Create a trainable dummy forward pass that actually uses model parameters
-        if target_mel is not None and hasattr(model, "gpt"):
+        # This is a FALLBACK when GPT forward fails
+        if target_mel is not None:
             try:
-                # Get a trainable parameter from the GPT model
+                # Get a trainable parameter from the model
                 gpt_param = None
-                for name, param in model.gpt.named_parameters():
-                    if param.requires_grad:
-                        gpt_param = param
-                        break
+                if hasattr(model, "gpt"):
+                    for name, param in model.gpt.named_parameters():
+                        if param.requires_grad:
+                            gpt_param = param
+                            break
+                
+                if gpt_param is None:
+                    # Try any model parameter
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            gpt_param = param
+                            break
                 
                 if gpt_param is not None:
                     # Create a simple loss that depends on the model parameter
@@ -534,8 +564,10 @@ def xtts_forward(
                         "speaker_embedding": spk.detach() if spk is not None
                                              else outputs["speaker_embedding"].detach(),
                     }
-                    if logger:
-                        logger.debug(f"Using Variant B: mel reconstruction via param mean (scale={scale.item():.6f})")
+                    if logger and not hasattr(xtts_forward, '_variant_b_warned'):
+                        logger.warning(f"Using Variant B: mel reconstruction via param mean (scale={scale.item():.6f})")
+                        logger.warning("This is a FALLBACK - GPT forward is not working. Training will be limited.")
+                        xtts_forward._variant_b_warned = True
                     return outputs, targets
                     
             except Exception as e:
